@@ -156,6 +156,8 @@ def parse_id_equals_any(text: str) -> set:
     return {p.strip() for p in parts if p.strip()}
 
 def clear_all_filters():
+    # Flag a one-shot reset and clear all filter widget states
+    st.session_state["__do_reset__"] = True
     for k in list(st.session_state.keys()):
         if k.startswith("flt_"):
             del st.session_state[k]
@@ -603,11 +605,14 @@ with st.sidebar:
     st.header("🔎 Column Filters")
     st.caption("Filters apply cumulatively.")
     st.button("🔁 Reset all filters", on_click=clear_all_filters)
-    #DEBUG_ENRICHR = st.checkbox("🔧 Verbose API logs", value=False)
-    
+
+    # Was a reset requested this run?
+    RESET_NOW = st.session_state.pop("__do_reset__", False)
+
     for col in df.columns:
         if is_pmid_col(col):
             continue
+
         series = df[col]
         keybase = sanitize_key(col)
         st.markdown(f"**{col}**")
@@ -615,89 +620,112 @@ with st.sidebar:
         if hint:
             st.caption(hint)
 
+        # --- ID-like (equals any) ------------------------------------------
+        if is_id_like(col):
+            key = keybase + "_idany"
+            default = ""
+            if RESET_NOW:
+                st.session_state[key] = default
+            txt = st.text_input("Equals any of …",
+                                value=st.session_state.get(key, default),
+                                key=key)
+            filters_meta.append({"col": col, "type": "id_any", "value": txt})
+            st.divider()
+            continue
+
+        # --- Type detection -------------------------------------------------
         try_numeric = is_numeric_series(series)
         try_dt = False if try_numeric else is_datetime_series(series)
         if try_dt and not safe_to_datetime(series, guess_datetime_format(series)).notna().any():
             try_dt = False
         try_bool = False if (try_numeric or try_dt) else is_booleanish_series(series)
 
+        # --- Numeric --------------------------------------------------------
         if try_numeric:
             s_num = coerce_numeric(series)
             if s_num.notna().any():
                 vmin = float(np.nanmin(s_num)); vmax = float(np.nanmax(s_num))
             else:
                 vmin = 0.0; vmax = 0.0
-            rng = st.slider("Range", min_value=float(vmin), max_value=float(vmax),
-                            value=(float(vmin), float(vmax)), key=keybase+"_range")
-            excl_na = st.checkbox("Exclude missing", value=False, key=keybase+"_exclna")
+            rng_key  = keybase + "_range"
+            excl_key = keybase + "_exclna"
+            default_rng  = (float(vmin), float(vmax))
+            default_excl = False
+            if RESET_NOW:
+                st.session_state[rng_key]  = default_rng
+                st.session_state[excl_key] = default_excl
+            rng = st.slider("Range",
+                            min_value=float(vmin), max_value=float(vmax),
+                            value=st.session_state.get(rng_key, default_rng),
+                            key=rng_key)
+            excl_na = st.checkbox("Exclude missing",
+                                  value=st.session_state.get(excl_key, default_excl),
+                                  key=excl_key)
             filters_meta.append({"col": col, "type": "range", "value": rng, "excl_na": excl_na})
 
+        # --- Datetime -------------------------------------------------------
         elif try_dt:
             dt_fmt = guess_datetime_format(series)
             s_dt = safe_to_datetime(series, dt_fmt)
             dmin = s_dt.min().date() if s_dt.notna().any() else None
             dmax = s_dt.max().date() if s_dt.notna().any() else None
             if dmin and dmax:
-                date_range = st.date_input("Date range", (dmin, dmax), key=keybase+"_daterange")
-                excl_na = st.checkbox("Exclude missing", value=False, key=keybase+"_exclna_dt")
-                filters_meta.append({"col": col, "type": "date_range", "value": date_range, "excl_na": excl_na, "dt_format": dt_fmt})
+                dr_key      = keybase + "_daterange"
+                excl_dt_key = keybase + "_exclna_dt"
+                default_dr       = (dmin, dmax)
+                default_excl_dt  = False
+                if RESET_NOW:
+                    st.session_state[dr_key]      = default_dr
+                    st.session_state[excl_dt_key] = default_excl_dt
+                date_range = st.date_input("Date range",
+                                           st.session_state.get(dr_key, default_dr),
+                                           key=dr_key)
+                excl_na = st.checkbox("Exclude missing",
+                                      value=st.session_state.get(excl_dt_key, default_excl_dt),
+                                      key=excl_dt_key)
+                filters_meta.append({"col": col, "type": "date_range", "value": date_range,
+                                     "excl_na": excl_na, "dt_format": dt_fmt})
             else:
                 st.caption("_No valid dates detected_")
 
+        # --- Boolean --------------------------------------------------------
         elif try_bool:
-            choice = st.selectbox("Value", ["Any", "True", "False"], key=keybase+"_bool")
+            bool_key = keybase + "_bool"
+            default_bool = "Any"
+            if RESET_NOW:
+                st.session_state[bool_key] = default_bool
+            # Use index to ensure "Any" shows selected
+            options = ["Any", "True", "False"]
+            choice = st.selectbox("Value", options,
+                                  index=options.index(st.session_state.get(bool_key, default_bool)),
+                                  key=bool_key)
             filters_meta.append({"col": col, "type": "bool", "value": choice})
 
+        # --- Text / categorical --------------------------------------------
         else:
             tokens = tokenize_options(series.astype(str))
             if 0 < len(tokens) <= MAX_MULTISELECT_OPTIONS:
-                sel = st.multiselect("Select", ["Any"] + tokens, default=["Any"], key=keybase+"_multi")
+                multi_key = keybase + "_multi"
+                default_multi = ["Any"]
+                if RESET_NOW:
+                    st.session_state[multi_key] = default_multi
+                sel = st.multiselect("Select",
+                                     ["Any"] + tokens,
+                                     default=st.session_state.get(multi_key, default_multi),
+                                     key=multi_key)
                 filters_meta.append({"col": col, "type": "multi", "value": sel})
             else:
-                query = st.text_input("Contains any of …", value="", key=keybase+"_contains")
+                txt_key = keybase + "_contains"
+                default_txt = ""
+                if RESET_NOW:
+                    st.session_state[txt_key] = default_txt
+                query = st.text_input("Contains any of …",
+                                      value=st.session_state.get(txt_key, default_txt),
+                                      key=txt_key)
                 filters_meta.append({"col": col, "type": "contains_any", "value": query})
+
         st.divider()
 
-# ---------- Apply filters ----------
-mask = pd.Series([True] * len(df))
-for f in filters_meta:
-    col = f["col"]; typ = f["type"]; val = f["value"]
-    if typ == "id_any":
-        ids = parse_id_equals_any(val)
-        if ids:
-            mask &= df[col].astype(str).isin(ids)
-    elif typ == "range":
-        lo, hi = val
-        s_num = coerce_numeric(df[col])
-        cond = s_num.between(lo, hi)
-        if not f.get("excl_na", False): cond = cond | s_num.isna()
-        mask &= cond
-    elif typ == "date_range":
-        fmt = f.get("dt_format")
-        s_dt = safe_to_datetime(df[col], fmt)
-        if isinstance(val, tuple) and len(val) == 2:
-            lo, hi = pd.to_datetime(val[0]), pd.to_datetime(val[1])
-            cond = s_dt.between(lo, hi)
-            if not f.get("excl_na", False):
-                cond = cond | s_dt.isna()
-            mask &= cond
-    elif typ == "bool":
-        if val in ("True", "False"):
-            s_b = coerce_bool(df[col]); want = (val == "True")
-            mask &= (s_b == want)
-    elif typ == "multi":
-        sel = [s for s in val if s != "Any"]
-        if sel:
-            sel_set = set(sel)
-            mask &= df[col].apply(lambda v: match_tokens(v, sel_set))
-    elif typ == "contains_any":
-        query = str(val).strip()
-        if query:
-            needles = [q.strip() for q in query.split(";") if q.strip()]
-            patt = "|".join(re.escape(q) for q in needles)
-            mask &= df[col].astype(str).str.contains(patt, case=False, na=False, regex=True)
-
-result = df.loc[mask].copy()
 
 # ---------- Results + downloads ----------
 st.subheader(f"📑 {len(result)} row{'s' if len(result)!=1 else ''} match your filters")
