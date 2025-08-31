@@ -1,35 +1,54 @@
 # ==========================================================
-# BHB Study Finder — Dynamic Column Filters (repo CSV + strict AgGrid)
+# BHB Study Finder — Dynamic Column Filters + Enrichr
+# (robust + recs + formatted EA + strong term sizes + adjP first)
 # ==========================================================
 from io import BytesIO
+import os, re, sys, traceback, numpy as np, pandas as pd, streamlit as st
 from pathlib import Path
-import os, re, numpy as np, pandas as pd, streamlit as st
-
-# --- FORCE AgGrid (no fallback) ---
-from st_aggrid import AgGrid, GridOptionsBuilder  # will raise if not installed
+import warnings, platform, json
+import requests
+import socket
+from typing import Optional, Dict
 
 # ---------- Page ----------
 st.set_page_config(page_title="BHB Study Finder", page_icon="🔬", layout="wide")
 st.title("🔬 BHB Study Finder")
 
 st.markdown("""
-This is a tool that let's you filter BHB studies according to several criteria such as study model, tissue or organ of interest, organelle of interest, method of increasing BHB level and other. You can see all the filter categories in the left panel.
+This is a tool that lets you filter BHB studies according to several criteria (model, tissue/organ(elle), method of increasing BHB, etc.). 
+Use the left sidebar to combine filters; results update live.
 
-**Why is this better than searching through literature via pubmed and keywords?**
-
-This filter tool uses AI to extract information from abstracts. The text exactly extracted from the abstract is searchable via the "Raw" filters. AI is then used again to put all of the raw output into more general and easy to search categories. For example, "HK-2 cells" is the raw text extracted from the abstract and it is then categorized under the specific "Renal tubular category" and broader "Epithelial - Renal & Urothelial". Similarly, extracted raw mechanisms like "NADH supply to respiratory chain" are categorized under broader category "Mitochondrial Function & Bioenergetics".
-
-Processing of the extracted data should make much easier for researchers to find studies most relevant to their interest. As big part of BHB research focus on its signalling effect, AI was also used to extract proposed targets of BHB from each of the abstracts. Targets are standardized to their official gene names so they can be quickly used for enrichment analysis and other bioinformatics tools.
+**About targets → enrichment:**  
+After filtering, the app extracts the set of **BHB targets** from the filtered studies (column *BHB Target*), standardizes them to official symbols, and can send them to **Enrichr** for pathway/GO enrichment via the public REST API.
 """)
 
+# ---------- AgGrid import with diagnostics ----------
+AGGRID_IMPORT_ERR = None
+HAVE_AGGRID = False
+ColumnsAutoSizeMode = None
+try:
+    from st_aggrid import AgGrid, GridOptionsBuilder
+    try:
+        from st_aggrid.shared import ColumnsAutoSizeMode
+    except Exception:
+        ColumnsAutoSizeMode = None  # older versions don't expose this
+    HAVE_AGGRID = True
+    print("[AgGrid] Import successful.")
+except Exception as e:
+    AGGRID_IMPORT_ERR = e
+    HAVE_AGGRID = False
+    AgGrid = GridOptionsBuilder = None
+    print("[AgGrid] Import failed:", repr(e))
+    print("[AgGrid] Traceback:\n", traceback.format_exc())
+
 # ---------- Config ----------
-APP_DIR = Path(__file__).resolve().parent
-DELIMS_PATTERN = r"[;,+/|]"
+DELIMS_PATTERN = r"[;,+/|]"  # for multi-value columns (incl. BHB Target)
 MAX_MULTISELECT_OPTIONS = 200
 BOOL_TRUE  = {"true","1","yes","y","t"}
 BOOL_FALSE = {"false","0","no","n","f"}
+APP_DIR = Path(__file__).resolve().parent
 
-# ---------- Permanent tips for specific filters ----------
+# ---------- Tips (permanent) ----------
 def _norm(s: str) -> str:
     return re.sub(r"[^a-z0-9]+","", s.lower())
 
@@ -48,13 +67,12 @@ TIPS = {
 def normalize(name: str) -> str:
     return re.sub(r"[^a-z0-9]+", "", str(name).lower())
 
-def is_pmid_col(colname: str) -> bool:
-    return normalize(colname) == "pmid"
-
 def is_id_like(colname: str) -> bool:
     n = normalize(colname)
-    # Treat other *ID columns as ID-like; exclude PMID (we skip its filter entirely)
-    return n in {"abstractid","pmcid","id","aid"} or (n.endswith("id") and n != "pmid")
+    return n in {"abstractid","pmcid","id","aid"} or n.endswith("id")
+
+def is_pmid_col(colname: str) -> bool:
+    return normalize(colname) == "pmid"
 
 def sanitize_key(s: str) -> str:
     return "flt_" + re.sub(r"[^a-zA-Z0-9_]", "_", s)
@@ -86,22 +104,46 @@ def to_excel_bytes(df: pd.DataFrame):
 
 def is_numeric_series(series: pd.Series, min_frac_numeric: float = 0.8) -> bool:
     s = pd.to_numeric(series, errors="coerce")
-    return (s.notna().mean() if len(s) else 0.0) >= min_frac_numeric
+    frac = s.notna().mean() if len(s) else 0.0
+    return frac >= min_frac_numeric
 
 def coerce_numeric(series: pd.Series) -> pd.Series:
     return pd.to_numeric(series, errors="coerce")
 
-def is_datetime_series(series: pd.Series, min_frac_dt: float = 0.8) -> bool:
-    s = pd.to_datetime(series, errors="coerce", utc=False)
-    return (s.notna().mean() if len(s) else 0.0) >= min_frac_dt
+def guess_datetime_format(series: pd.Series, sample_size: int = 500) -> str | None:
+    candidates = [
+        "%Y-%m-%d","%Y/%m/%d","%d/%m/%Y","%m/%d/%Y",
+        "%Y-%m-%d %H:%M:%S","%Y/%m/%d %H:%M:%S",
+        "%Y-%m-%dT%H:%M:%S","%Y-%m-%dT%H:%M:%S.%f",
+    ]
+    s = series.dropna().astype(str)
+    if len(s) > sample_size:
+        s = s.sample(sample_size, random_state=0)
+    best_fmt, best_rate = None, 0.0
+    for fmt in candidates:
+        parsed = pd.to_datetime(s, errors="coerce", format=fmt, utc=False)
+        rate = parsed.notna().mean()
+        if rate > best_rate:
+            best_rate, best_fmt = rate, fmt
+    return best_fmt if best_rate >= 0.8 else None
 
-def coerce_datetime(series: pd.Series) -> pd.Series:
-    return pd.to_datetime(series, errors="coerce", utc=False)
+def safe_to_datetime(series: pd.Series, fmt: str | None) -> pd.Series:
+    with warnings.catch_warnings():
+        warnings.filterwarnings("ignore", message=".*infer_datetime_format.*", category=UserWarning)
+        warnings.filterwarnings("ignore", message="Could not infer format.*", category=UserWarning)
+        return pd.to_datetime(series, errors="coerce", format=fmt, utc=False)
+
+def is_datetime_series(series: pd.Series, min_frac_dt: float = 0.8) -> bool:
+    fmt = guess_datetime_format(series)
+    s = safe_to_datetime(series, fmt)
+    frac = s.notna().mean() if len(s) else 0.0
+    return frac >= min_frac_dt
 
 def is_booleanish_series(series: pd.Series, min_frac_bool: float = 0.9) -> bool:
     s = series.dropna().astype(str).str.strip().str.lower()
     ok = s.isin(BOOL_TRUE | BOOL_FALSE)
-    return (ok.mean() if len(s) else 0.0) >= min_frac_bool
+    frac = ok.mean() if len(s) else 0.0
+    return frac >= min_frac_bool
 
 def coerce_bool(series: pd.Series) -> pd.Series:
     s = series.astype(str).str.strip().str.lower()
@@ -123,7 +165,6 @@ def discover_repo_csv() -> Path | None:
     # Prefer explicit path via Secrets/Env, but don't crash if secrets.toml is missing
     ds = None
     try:
-        # Use .get(...) if available, but wrap in try/except because any access can parse/raise
         ds = st.secrets.get("DATASET_PATH", None)  # type: ignore[attr-defined]
     except Exception:
         ds = None
@@ -139,24 +180,418 @@ def discover_repo_csv() -> Path | None:
         if p.exists():
             return p
 
-    # Common names in root
     for name in ("bhb_studies.csv", "studies.csv", "dataset.csv"):
         p = (APP_DIR / name).resolve()
         if p.exists():
             return p
 
-    # Fallback: first CSV in root, then ./data
     candidates = list(APP_DIR.glob("*.csv"))
     data_dir = APP_DIR / "data"
     if not candidates and data_dir.exists():
         candidates = list(data_dir.glob("*.csv"))
     return candidates[0].resolve() if candidates else None
 
+def http_debug(resp):
+    try:
+        st.write(f"**Request:** {resp.request.method} {resp.url}")
+    except Exception:
+        pass
+    st.write("**Status:**", resp.status_code, " • **Elapsed:**", getattr(resp, "elapsed", "n/a"))
+    try:
+        st.write("**Response headers (subset):**", {k: v for k, v in resp.headers.items() if k.lower() in {"content-type","server","date"}})
+    except Exception:
+        pass
+    body_preview = (resp.text or "")[:1000]
+    st.code(body_preview if body_preview else "(empty body)")
 
-# ---------- Data (auto-load from repo; no dataset section) ----------
-csv_path = discover_repo_csv()
-if not csv_path:
-    st.error("No dataset found. Put a CSV in the repo root (e.g., `bhb_studies.csv`) or set `DATASET_PATH` in Secrets.")
+def _http_debug(resp):
+    try:
+        http_debug(resp)
+    except Exception:
+        pass
+
+# ---------- Robust HTTP session & diagnostics for Enrichr ----------
+def secrets_bool(key: str, default: bool = False) -> bool:
+    try:
+        return bool(st.secrets.get(key, default))  # type: ignore[attr-defined]
+    except Exception:
+        v = os.environ.get(key)
+        if v is None:
+            return default
+        return v.strip().lower() in {"1", "true", "yes", "y"}
+
+ENRICHR_BASES = [
+    "https://maayanlab.cloud/Enrichr",
+    "http://maayanlab.cloud/Enrichr",
+    "https://amp.pharm.mssm.edu/Enrichr",  # legacy hostname
+]
+
+def make_session(force_ipv4: bool = False) -> requests.Session:
+    if force_ipv4:
+        try:
+            import urllib3.util.connection as urllib3_cn
+            def allowed_gai_family():
+                return socket.AF_INET
+            urllib3_cn.allowed_gai_family = allowed_gai_family
+        except Exception:
+            pass
+    from urllib3.util.retry import Retry
+    from requests.adapters import HTTPAdapter
+    s = requests.Session()
+    s.headers.update({"User-Agent": "BHBStudyFinder/0.1"})
+    retry = Retry(
+        total=3, connect=3, read=3, backoff_factor=0.5,
+        status_forcelist=[429, 500, 502, 503, 504],
+        allowed_methods=frozenset(["GET", "POST"]),
+        raise_on_status=False,
+    )
+    adapter = HTTPAdapter(max_retries=retry)
+    s.mount("https://", adapter)
+    s.mount("http://", adapter)
+    return s
+
+def _first_ok_base(session: requests.Session, debug: bool = False) -> Optional[str]:
+    for base in ENRICHR_BASES:
+        try:
+            r = session.get(f"{base}/datasetStatistics", timeout=15)
+            if debug: _http_debug(r)
+            if r.ok:
+                return base
+        except requests.RequestException as e:
+            if debug:
+                st.write(f"Base check failed for {base}: {repr(e)}")
+    return None
+
+def _endpoints(session: requests.Session, debug: bool = False):
+    base = _first_ok_base(session, debug=debug)
+    if not base:
+        raise RuntimeError("Could not reach any Enrichr endpoint (network/TLS/DNS issue).")
+    return (f"{base}/addList", f"{base}/enrich")
+
+# ---------- BHB Target helpers ----------
+TARGET_TOKEN_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.:-]{0,19}$")
+BAD_TOKENS = {"NA", "N/A", "NONE", "NULL", "-"}
+
+def find_bhb_target_col(columns: list[str]) -> str | None:
+    for c in columns:
+        if normalize(c) == "bhbtarget":
+            return c
+    for c in columns:
+        if "target" in normalize(c):
+            return c
+    return None
+
+def extract_targets_from_df(df: pd.DataFrame) -> list[str]:
+    col = find_bhb_target_col(list(df.columns))
+    if not col:
+        return []
+    genes = []
+    for cell in df[col].dropna().astype(str):
+        parts = [t.strip() for t in re.split(DELIMS_PATTERN, cell) if t.strip()]
+        for tok in parts:
+            tok_up = tok.upper()
+            if " " in tok_up:
+                continue
+            if tok_up in BAD_TOKENS:
+                continue
+            if TARGET_TOKEN_RE.match(tok_up):
+                genes.append(tok_up)
+    seen, uniq = set(), []
+    for g in genes:
+        if g not in seen:
+            uniq.append(g); seen.add(g)
+    return uniq
+
+# ---------- Enrichr REST (robust) ----------
+DEFAULT_LIBRARIES = [
+    "GO_Biological_Process_2023",
+    "GO_Cellular_Component_2023",
+    "GO_Molecular_Function_2023",
+    "KEGG_2021_Human",
+    "Reactome_2022",
+    "WikiPathways_2023_Human",
+    "MSigDB_Hallmark_2020",
+    "TRRUST_Transcription_Factors_2019",
+]
+
+@st.cache_data(show_spinner=False)
+def enrichr_add_list(genes: list[str], description: str = "BHB Study Finder selection", debug: bool = False) -> dict:
+    s = make_session(force_ipv4=secrets_bool("FORCE_IPV4", False))
+    ENRICHR_ADD, _ = _endpoints(s, debug=debug)
+    payload = {"list": "\n".join(genes), "description": description}
+    try:
+        r = s.post(ENRICHR_ADD, data=payload, timeout=30)
+        if debug: _http_debug(r)
+        r.raise_for_status()
+        return r.json()
+    except requests.RequestException:
+        try:
+            files = {"list": (None, "\n".join(genes)), "description": (None, description)}
+            r2 = s.post(ENRICHR_ADD, files=files, timeout=30)
+            if debug: _http_debug(r2)
+            r2.raise_for_status()
+            return r2.json()
+        except requests.RequestException as e2:
+            raise RuntimeError(f"Enrichr addList connection failed: {repr(e2)}") from e2
+    except ValueError as ve:
+        raise RuntimeError(f"Enrichr addList returned non-JSON: {repr(ve)}")
+
+@st.cache_data(show_spinner=False)
+def enrichr_libraries(debug: bool = False) -> list[str]:
+    s = make_session(force_ipv4=secrets_bool("FORCE_IPV4", False))
+    base = _first_ok_base(s, debug=debug)
+    if not base:
+        raise RuntimeError("Could not reach any Enrichr endpoint (network/TLS/DNS issue).")
+    url = f"{base}/datasetStatistics"
+    try:
+        r = s.get(url, timeout=30)
+        if debug: _http_debug(r)
+        r.raise_for_status()
+        data = r.json()
+    except requests.RequestException as e:
+        raise RuntimeError(f"Enrichr libraries fetch failed: {repr(e)}") from e
+    items = data.get("statistics", data) if isinstance(data, dict) else data
+    libs = []
+    for x in items:
+        if isinstance(x, dict):
+            name = x.get("libraryName") or x.get("library")
+            if name:
+                libs.append(name)
+    return sorted(set(libs))
+
+# ---- Detect overlap ratio ("k/K") directly in raw Enrichr rows
+def _detect_overlap_ratio(rows: list[list]) -> list[Optional[str]]:
+    out = []
+    pat = re.compile(r"^\s*\d+\s*/\s*\d+\s*$")
+    for r in rows:
+        found = None
+        for el in r:
+            if isinstance(el, str) and pat.match(el):
+                found = el.strip().replace(" ", "")
+                break
+        out.append(found)
+    return out
+
+def _coerce_rows_to_df(rows: list[list]) -> pd.DataFrame:
+    """
+    Normalize Enrichr result rows into a tidy table.
+    Also capture an 'Overlap' ratio if present (k/K).
+    """
+    if not rows:
+        return pd.DataFrame(columns=["Term","P-value","Adjusted P-value","Z-score","Combined Score","Overlap Genes"])
+
+    overlap_ratio = _detect_overlap_ratio(rows)
+    first = rows[0]
+    if isinstance(first[0], (int, float)) and not isinstance(first[1], (int, float)):
+        cols = ["Rank","Term","P-value","Z-score","Combined Score","Overlap Genes","Adjusted P-value","Old P-value","Old Adjusted P-value","Odds Ratio","Extra"]
+        df = pd.DataFrame(rows, columns=cols[:len(first)])
+    else:
+        cols = ["Term","P-value","Z-score","Combined Score","Overlap Genes","Adjusted P-value","Old P-value","Old Adjusted P-value","Odds Ratio","Extra"]
+        df = pd.DataFrame(rows, columns=cols[:len(first)])
+        if "Rank" not in df.columns:
+            df.insert(0, "Rank", range(1, len(df)+1))
+
+    if "Overlap Genes" in df.columns:
+        df["Overlap Genes"] = df["Overlap Genes"].astype(str).str.replace(r"[|]", ", ", regex=True)
+
+    if any(overlap_ratio):
+        df["Overlap"] = overlap_ratio
+
+    # Drop legacy columns we don't want to show
+    df = df.drop(columns=["Old P-value", "Old Adjusted P-value"], errors="ignore")
+    
+
+    sort_col = "Adjusted P-value" if "Adjusted P-value" in df.columns else "P-value"
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        df[sort_col] = pd.to_numeric(df[sort_col], errors="coerce")
+    df = df.sort_values(by=sort_col, ascending=True, kind="mergesort").reset_index(drop=True)
+    return df
+
+def enrichr_enrich(user_list_id: int, library: str, debug: bool = False) -> pd.DataFrame:
+    s = make_session(force_ipv4=secrets_bool("FORCE_IPV4", False))
+    _, ENRICHR_ENR = _endpoints(s, debug=debug)
+    params = {"userListId": user_list_id, "backgroundType": library}
+    try:
+        r = s.get(ENRICHR_ENR, params=params, timeout=60)
+        if debug: _http_debug(r)
+        r.raise_for_status()
+        try:
+            data = r.json()
+        except ValueError:
+            raise RuntimeError(f"Enrichr enrich returned non-JSON:\n{r.text[:1000]}")
+    except requests.RequestException as e:
+        raise RuntimeError(f"Enrichr enrich failed for {library}: {repr(e)}") from e
+    rows = next(iter(data.values())) if isinstance(data, dict) else data
+    return _coerce_rows_to_df(rows)
+
+# ----- NEW: Formatting + term-size lookup for Overlap % -----
+# Replace your existing _format_p with this:
+def _format_p(value) -> str:
+    """4 d.p. normally; for values <1e-4, use compact scientific (e.g., 3.2E-07)."""
+    try:
+        v = float(value)
+    except (TypeError, ValueError):
+        return ""
+    if not np.isfinite(v):
+        return ""
+    if v < 1e-4:
+        s = f"{v:.2E}"  # scientific notation, 2 significant digits
+        # trim trailing zeros in the mantissa: 3.00E-07 -> 3E-07, 3.20E-07 -> 3.2E-07
+        s = re.sub(r"(\.\d*?[1-9])0+E", r"\1E", s)
+        s = re.sub(r"\.0+E", "E", s)
+        return s
+    return f"{v:.4f}"
+
+
+def _count_overlap_genes(s: str) -> int:
+    if s is None or (isinstance(s, float) and np.isnan(s)):
+        return 0
+    return sum(1 for g in str(s).split(",") if g.strip())
+
+def _normalize_term_key(term: str) -> str:
+    """
+    Normalize term strings to improve matching with /geneSetLibrary:
+    - Lowercase
+    - Remove ' - Homo sapiens', '(Homo sapiens)', '(GO:####)', '(R-XXX-####)', '(WP####)'
+    - Strip punctuation/spaces -> alnum key
+    """
+    t = str(term)
+    t = re.sub(r"\s*[-–]\s*Homo sapiens$", "", t, flags=re.IGNORECASE)
+    t = re.sub(r"\s*\((?:Homo sapiens|GO:\d+|R-[A-Z]+-\d+|WP\d+)\)\s*$", "", t, flags=re.IGNORECASE)
+    t = t.lower()
+    t = re.sub(r"[^a-z0-9]+", "", t)
+    return t
+
+@st.cache_data(show_spinner=False)
+# ⬇️ REPLACE your current enrichr_termsizes with this GMT-based version
+@st.cache_data(show_spinner=False)
+def enrichr_termsizes(library: str, debug: bool = False) -> Dict[str, int]:
+    """
+    Return {term -> gene set size} for an Enrichr library by downloading the GMT.
+    This is more consistent than JSON across libraries.
+    """
+    s = make_session(force_ipv4=secrets_bool("FORCE_IPV4", False))
+    base = _first_ok_base(s, debug=debug)
+    if not base:
+        raise RuntimeError("Could not reach any Enrichr endpoint (network/TLS/DNS issue).")
+
+    url = f"{base}/geneSetLibrary"
+    # Ask for GMT text; one term per line: <term>\t<desc/url>\t<gene1>\t<gene2>...
+    params = {"mode": "text", "libraryName": library}
+    r = s.get(url, params=params, timeout=60)
+    if debug: _http_debug(r)
+    r.raise_for_status()
+    text = r.text
+
+    sizes: Dict[str, int] = {}
+    for line in text.splitlines():
+        if not line.strip():
+            continue
+        parts = line.rstrip("\n").split("\t")
+        if len(parts) >= 3:
+            term = parts[0]
+            sizes[term] = len(parts) - 2  # number of genes on this GMT line
+        # (Some rare lines may be malformed; we just skip them.)
+
+    # If you want to keep the normalized-key lookup working smoothly:
+    # also cache a normalized map alongside the raw one
+    sizes["_norm_map_"] = { _normalize_term_key(t): sz for t, sz in sizes.items() }  # type: ignore[index]
+    return sizes
+
+
+def _augment_enrichr_table(df: pd.DataFrame, library: str):
+    """
+    Returns (df_numeric, df_display):
+      - df_numeric: numeric columns for downloads (adds Overlap #, Gene set size, Overlap %)
+      - df_display: formatted p-values and Overlap %, with Adjusted P-value before P-value
+    Gene set size (K) strategy:
+      1) Parse 'Overlap' column 'k/K' if present.
+      2) Else use /geneSetLibrary and match terms with normalized keys.
+    """
+    df_num = df.copy()
+
+    # Overlap counts (k)
+    if "Overlap Genes" in df_num.columns:
+        k = df_num["Overlap Genes"].apply(_count_overlap_genes)
+    else:
+        k = pd.Series([np.nan] * len(df_num), index=df_num.index)
+
+    # 1) Try to parse K from Overlap ratio if present
+    K_series = pd.Series([np.nan] * len(df_num), index=df_num.index, dtype="float")
+    if "Overlap" in df_num.columns:
+        parts = df_num["Overlap"].astype(str).str.extract(r"^\s*(\d+)\s*/\s*(\d+)\s*$")
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            num = pd.to_numeric(parts[0], errors="coerce")
+            den = pd.to_numeric(parts[1], errors="coerce")
+        k = k.fillna(num)
+        K_series = den
+
+    # 2) Fallback: pull K via /geneSetLibrary with normalized key mapping
+    
+
+    # ⬇️ In _augment_enrichr_table(), inside the "fallback: pull K via /geneSetLibrary" block:
+    if K_series.isna().all():
+        try:
+            sizes = enrichr_termsizes(library, debug=False)
+        except Exception:
+            sizes = {}
+        if sizes:
+            norm_map = sizes.get("_norm_map_", {}) if isinstance(sizes, dict) else {}
+            if not norm_map:  # build if we didn't store it for some reason
+                norm_map = { _normalize_term_key(t): sz for t, sz in sizes.items() if isinstance(t, str) }
+            K_series = df_num["Term"].map(lambda t: norm_map.get(_normalize_term_key(str(t)), np.nan))
+
+
+    # Compose numeric outputs
+    df_num["Overlap #"] = pd.to_numeric(k, errors="coerce").round(0).astype("Int64")
+    df_num["Gene set size"] = pd.to_numeric(K_series, errors="coerce").round(0).astype("Int64")
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        df_num["Overlap %"] = np.where(
+            df_num["Gene set size"].notna() & (df_num["Gene set size"].astype(float) > 0),
+            (df_num["Overlap #"].astype(float) / df_num["Gene set size"].astype(float)) * 100.0,
+            np.nan
+        )
+
+    # Pretty copy for display
+    df_disp = df_num.copy()
+    # Format p-values
+    for col in ("P-value", "Adjusted P-value"):
+        if col in df_disp.columns:
+            df_disp[col] = df_disp[col].apply(_format_p)
+    # Format Overlap %
+    if "Overlap %" in df_disp.columns:
+        df_disp["Overlap %"] = df_disp["Overlap %"].apply(lambda v: "" if pd.isna(v) else f"{v:.1f}")
+
+    # Reorder columns — Adjusted P-value before P-value
+    desired = [
+    "Rank", "Term",
+    "Adjusted P-value", "P-value",
+    "Z-score", "Combined Score",
+    "Gene set size", "Overlap #", "Overlap %",
+    "Overlap Genes"
+]
+
+    def _reorder(df_):
+        first = [c for c in desired if c in df_.columns]
+        rest  = [c for c in df_.columns if c not in first]
+        return df_[first + rest]
+    df_num  = _reorder(df_num)
+    df_disp = _reorder(df_disp)
+
+    return df_num, df_disp
+
+# ---------- Data source ----------
+csv_path = None
+try:
+    csv_path = discover_repo_csv()
+    if not csv_path:
+        st.error("No dataset found. Put a CSV in the repo root (e.g., `bhb_studies.csv`) or set `DATASET_PATH` in Secrets.")
+        st.stop()
+except Exception as e:
+    st.error(f"Failed to locate dataset: {e}")
     st.stop()
 
 df = pd.read_csv(csv_path, low_memory=False)
@@ -168,11 +603,11 @@ with st.sidebar:
     st.header("🔎 Column Filters")
     st.caption("Filters apply cumulatively.")
     st.button("🔁 Reset all filters", on_click=clear_all_filters)
-
+    DEBUG_ENRICHR = st.checkbox("🔧 Verbose API logs", value=False)
+    
     for col in df.columns:
-        if is_pmid_col(col):  # keep column visible but do not render a filter for PMID
+        if is_pmid_col(col):
             continue
-
         series = df[col]
         keybase = sanitize_key(col)
         st.markdown(f"**{col}**")
@@ -180,35 +615,34 @@ with st.sidebar:
         if hint:
             st.caption(hint)
 
-        # ID-like (except PMID) → equals-any input
-        if is_id_like(col):
-            txt = st.text_input("Equals any of …", value="", key=keybase+"_idany")
-            filters_meta.append({"col": col, "type": "id_any", "value": txt})
-            st.divider()
-            continue
-
-        # Type detection: numeric > datetime > booleanish > text/categorical
         try_numeric = is_numeric_series(series)
         try_dt = False if try_numeric else is_datetime_series(series)
-        if try_dt and not coerce_datetime(series).notna().any():
+        if try_dt and not safe_to_datetime(series, guess_datetime_format(series)).notna().any():
             try_dt = False
         try_bool = False if (try_numeric or try_dt) else is_booleanish_series(series)
 
         if try_numeric:
             s_num = coerce_numeric(series)
-            vmin = float(np.nanmin(s_num)) if s_num.notna().any() else 0.0
-            vmax = float(np.nanmax(s_num)) if s_num.notna().any() else 0.0
+            if s_num.notna().any():
+                vmin = float(np.nanmin(s_num)); vmax = float(np.nanmax(s_num))
+            else:
+                vmin = 0.0; vmax = 0.0
             rng = st.slider("Range", min_value=float(vmin), max_value=float(vmax),
                             value=(float(vmin), float(vmax)), key=keybase+"_range")
             excl_na = st.checkbox("Exclude missing", value=False, key=keybase+"_exclna")
             filters_meta.append({"col": col, "type": "range", "value": rng, "excl_na": excl_na})
 
         elif try_dt:
-            s_dt = coerce_datetime(series)
-            dmin = s_dt.min().date(); dmax = s_dt.max().date()
-            date_range = st.date_input("Date range", (dmin, dmax), key=keybase+"_daterange")
-            excl_na = st.checkbox("Exclude missing", value=False, key=keybase+"_exclna_dt")
-            filters_meta.append({"col": col, "type": "date_range", "value": date_range, "excl_na": excl_na})
+            dt_fmt = guess_datetime_format(series)
+            s_dt = safe_to_datetime(series, dt_fmt)
+            dmin = s_dt.min().date() if s_dt.notna().any() else None
+            dmax = s_dt.max().date() if s_dt.notna().any() else None
+            if dmin and dmax:
+                date_range = st.date_input("Date range", (dmin, dmax), key=keybase+"_daterange")
+                excl_na = st.checkbox("Exclude missing", value=False, key=keybase+"_exclna_dt")
+                filters_meta.append({"col": col, "type": "date_range", "value": date_range, "excl_na": excl_na, "dt_format": dt_fmt})
+            else:
+                st.caption("_No valid dates detected_")
 
         elif try_bool:
             choice = st.selectbox("Value", ["Any", "True", "False"], key=keybase+"_bool")
@@ -222,47 +656,40 @@ with st.sidebar:
             else:
                 query = st.text_input("Contains any of …", value="", key=keybase+"_contains")
                 filters_meta.append({"col": col, "type": "contains_any", "value": query})
-
         st.divider()
 
 # ---------- Apply filters ----------
 mask = pd.Series([True] * len(df))
 for f in filters_meta:
-    col, typ, val = f["col"], f["type"], f["value"]
-
+    col = f["col"]; typ = f["type"]; val = f["value"]
     if typ == "id_any":
         ids = parse_id_equals_any(val)
         if ids:
             mask &= df[col].astype(str).isin(ids)
-
     elif typ == "range":
         lo, hi = val
         s_num = coerce_numeric(df[col])
         cond = s_num.between(lo, hi)
-        if not f.get("excl_na", False):
-            cond = cond | s_num.isna()
+        if not f.get("excl_na", False): cond = cond | s_num.isna()
         mask &= cond
-
     elif typ == "date_range":
-        s_dt = coerce_datetime(df[col])
+        fmt = f.get("dt_format")
+        s_dt = safe_to_datetime(df[col], fmt)
         if isinstance(val, tuple) and len(val) == 2:
             lo, hi = pd.to_datetime(val[0]), pd.to_datetime(val[1])
             cond = s_dt.between(lo, hi)
             if not f.get("excl_na", False):
                 cond = cond | s_dt.isna()
             mask &= cond
-
     elif typ == "bool":
         if val in ("True", "False"):
             s_b = coerce_bool(df[col]); want = (val == "True")
             mask &= (s_b == want)
-
     elif typ == "multi":
         sel = [s for s in val if s != "Any"]
         if sel:
             sel_set = set(sel)
             mask &= df[col].apply(lambda v: match_tokens(v, sel_set))
-
     elif typ == "contains_any":
         query = str(val).strip()
         if query:
@@ -275,21 +702,195 @@ result = df.loc[mask].copy()
 # ---------- Results + downloads ----------
 st.subheader(f"📑 {len(result)} row{'s' if len(result)!=1 else ''} match your filters")
 
-# EXACT classic AgGrid setup you liked
-gob = GridOptionsBuilder.from_dataframe(result)
-gob.configure_pagination(paginationPageSize=20)  # pager visible + clickable
-gob.configure_default_column(filter=True, sortable=True, resizable=True)
-AgGrid(result, gridOptions=gob.build(), height=450, theme="alpine")
+PAGE_SIZE = 20
+GRID_HEIGHT = 600
 
-st.download_button(
-    "💾 Excel",
-    to_excel_bytes(result),
-    "filtered_rows.xlsx",
-    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-)
-st.download_button(
-    "🗒️ CSV",
-    result.to_csv(index=False),
-    "filtered_rows.csv",
-    mime="text/csv",
-)
+if HAVE_AGGRID:
+    gob = GridOptionsBuilder.from_dataframe(result)
+    try:
+        gob.configure_pagination(paginationAutoPageSize=False, paginationPageSize=PAGE_SIZE)
+    except TypeError:
+        gob.configure_pagination(paginationPageSize=PAGE_SIZE)
+    gob.configure_default_column(filter=True, sortable=True, resizable=True)
+    gob.configure_grid_options(domLayout="normal")
+    grid_opts = gob.build()
+    AgGrid(
+        result,
+        gridOptions=grid_opts,
+        height=GRID_HEIGHT,
+        theme="alpine",
+        fit_columns_on_grid_load=False,
+        columns_auto_size_mode=(ColumnsAutoSizeMode.FIT_CONTENTS if ColumnsAutoSizeMode else None),
+    )
+else:
+    st.info("Interactive grid unavailable (streamlit-aggrid not installed). Showing a simple table instead.")
+    st.dataframe(result, use_container_width=True, height=GRID_HEIGHT)
+
+col_dl1, col_dl2 = st.columns(2)
+with col_dl1:
+    st.download_button("💾 Excel of filtered rows", to_excel_bytes(result), "filtered_rows.xlsx",
+                       mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+with col_dl2:
+    st.download_button("🗒️ CSV of filtered rows", result.to_csv(index=False), "filtered_rows.csv", mime="text/csv")
+
+# ---------- Enrichment Analysis ----------
+st.markdown("---")
+st.subheader("🧬 Enrichment Analysis")
+
+# Load ALL libraries up-front for multiselect options
+libs_all, libs_err = [], None
+try:
+    libs_all = enrichr_libraries(debug=False)
+except Exception as e:
+    libs_err = e
+
+# Concise recommendations (8 libs)
+st.markdown("""
+**Recommended libraries (quick guide)**  
+Use these to capture BHB’s main biology (bioenergetics, metabolism, inflammation, regulation):
+- **MSigDB_Hallmark_2020** — compact, non-redundant high-level pathways for a clean overview.
+- **GO_Biological_Process_2023** — process-level signal (e.g., autophagy, fatty-acid metabolism).
+- **GO_Cellular_Component_2023** — subcellular context (mitochondrion, peroxisome, chromatin).
+- **GO_Molecular_Function_2023** — activities (dehydrogenase, transporter, oxidoreductase).
+- **Reactome_2022** — curated signaling & metabolic routes (PDH/TCA, immune signaling).
+- **KEGG_2021_Human** — metabolism maps (ketone bodies, TCA, insulin, AMPK) & disease links.
+- **WikiPathways_2023_Human** — community pathways; often niche metabolic/mitochondrial maps.
+- **TRRUST_Transcription_Factors_2019** — upstream TFs (e.g., HIF1A, NFKB1) driving your targets.
+""")
+
+# List all libraries button
+lib_list_container = st.container()
+if lib_list_container.button("📚 List available Enrichr libraries"):
+    try:
+        if not libs_all and libs_err:
+            raise libs_err
+        st.success(f"Fetched {len(libs_all)} libraries from Enrichr")
+        st.dataframe(pd.DataFrame({"library": libs_all}), use_container_width=True, height=400)
+    except Exception as e:
+        st.exception(e)
+
+targets = extract_targets_from_df(result)
+n_targets = len(targets)
+
+if n_targets == 0:
+    st.info("No targets found in the filtered rows. Make sure your dataset has a column named **BHB Target** (or any column containing 'target').")
+else:
+    st.markdown(f"**Filtered target set:** {n_targets} unique symbols")
+    preview = ", ".join(targets[:50]) + (" …" if n_targets > 50 else "")
+    st.code(preview or "(empty)")
+
+    with st.expander("Run enrichment (Enrichr)", expanded=True):
+        st.caption("Choose Enrichr libraries (type to search).")
+
+        RECOMMENDED_LIBS = [
+            "MSigDB_Hallmark_2020",
+            "GO_Biological_Process_2023",
+            "GO_Cellular_Component_2023",
+            "GO_Molecular_Function_2023",
+            "Reactome_2022",
+            "KEGG_2021_Human",
+            "WikiPathways_2023_Human",
+            "TRRUST_Transcription_Factors_2019",
+        ]
+
+        if libs_all:
+            defaults = [lib for lib in RECOMMENDED_LIBS if lib in libs_all] or libs_all[:3]
+            options = libs_all
+        else:
+            defaults = RECOMMENDED_LIBS[:3]
+            options = DEFAULT_LIBRARIES
+
+        libs = st.multiselect(
+            "Gene set libraries (Enrichr ‘backgroundType’ names)",
+            options=options,
+            default=defaults
+        )
+        topn = st.slider("Show top N terms per library", 5, 50, 20, step=5)
+        run_btn = st.button("🚀 Run Enrichment")
+
+        if run_btn:
+            user_list_id = None
+            try:
+                with st.spinner("Uploading gene list to Enrichr…"):
+                    add_res = enrichr_add_list(targets, description="BHB Study Finder selection")
+                    user_list_id = add_res.get("userListId")
+                    if not user_list_id:
+                        st.error(f"Unexpected response from Enrichr:\n{json.dumps(add_res, indent=2)}")
+                        st.stop()
+            except requests.HTTPError as he:
+                st.error(f"Upload to Enrichr failed (HTTP): {he}")
+                st.stop()
+            except Exception as e:
+                st.error(f"Upload to Enrichr failed: {e}")
+                st.stop()
+
+            if not libs:
+                st.warning("Please select at least one library.")
+            else:
+                tabs = st.tabs(libs)
+                for lib, tab in zip(libs, tabs):
+                    with tab:
+                        try:
+                            with st.spinner(f"Enriching against **{lib}**…"):
+                                df_lib = enrichr_enrich(user_list_id, lib, debug=False)
+                            if df_lib.empty:
+                                st.info("No significant terms returned.")
+                            else:
+                                df_num, df_disp = _augment_enrichr_table(df_lib, lib)
+
+                                st.dataframe(df_disp.head(topn), use_container_width=True)
+
+                                # If a library provides no sizes, tell the user briefly
+                                if df_num["Gene set size"].isna().all():
+                                    st.caption("ℹ️ Gene set sizes were not available/matchable for this library; Overlap % left blank.")
+
+                                c1, c2 = st.columns(2)
+                                with c1:
+                                    st.download_button(
+                                        f"⬇️ CSV — {lib}",
+                                        df_num.to_csv(index=False),
+                                        file_name=f"enrichr_{lib}.csv",
+                                        mime="text/csv"
+                                    )
+                                with c2:
+                                    st.download_button(
+                                        f"⬇️ Excel — {lib}",
+                                        to_excel_bytes(df_num),
+                                        file_name=f"enrichr_{lib}.xlsx",
+                                        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+                                    )
+                        except requests.HTTPError as he:
+                            st.error(f"Enrichr returned an HTTP error for `{lib}`: {he}")
+                        except Exception as e:
+                            st.error(f"Failed to fetch enrichment for `{lib}`: {e}")
+
+# ---------- Debug panel ----------
+with st.sidebar.expander("🪲 Debug", expanded=False):
+    st.write("**Python**:", sys.version.split()[0], platform.platform())
+    try:
+        import importlib.metadata as ilm
+        ag_ver = ilm.version("streamlit-aggrid")
+        st.write("**streamlit-aggrid**:", ag_ver)
+        print("[AgGrid] Detected streamlit-aggrid version:", ag_ver)
+    except Exception as e:
+        st.write("**streamlit-aggrid**: not installed or not detected:", repr(e))
+        print("[AgGrid] streamlit-aggrid not detected:", repr(e))
+    st.write("**Streamlit**:", st.__version__)
+    st.write("**HAVE_AGGRID**:", HAVE_AGGRID)
+    if AGGRID_IMPORT_ERR:
+        st.write("**AgGrid import error**:", repr(AGGRID_IMPORT_ERR))
+        st.code(traceback.format_exc(), language="text")
+
+# Optional network self-test (remove if you don't want it)
+with st.sidebar.expander("🌐 Network self-test", expanded=False):
+    st.caption("If connections fail in production, consider setting secret/env `FORCE_IPV4=true`.")
+    if st.button("Test Enrichr reachability"):
+        try:
+            s = make_session(force_ipv4=secrets_bool("FORCE_IPV4", False))
+            base = _first_ok_base(s, debug=False)
+            if base:
+                st.success(f"Reachable: {base}")
+            else:
+                st.error("No Enrichr base reachable (network/TLS/DNS issue).")
+        except Exception as e:
+            st.exception(e)
