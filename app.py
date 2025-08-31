@@ -534,12 +534,13 @@ st.caption(f"Loaded dataset: `{csv_path.name}` • {len(df):,} rows, {df.shape[1
 
 # ---------- Reset logic ----------
 def clear_all_filters():
-    # Flag a one-shot reset and clear all filter widget states
+    # Flag a one-shot reset and clear individual filter widget states
     st.session_state["__do_reset__"] = True
     for k in list(st.session_state.keys()):
         if k.startswith("flt_"):
-            del st.session_state[k]
-    st.rerun()
+            st.session_state.pop(k, None)
+    # <- no st.rerun() here
+
 
 # ---------- Sidebar: dynamic filters (with true reset-to-“Any”) ----------
 filters_meta = []
