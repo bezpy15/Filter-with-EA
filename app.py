@@ -603,7 +603,7 @@ with st.sidebar:
     st.header("🔎 Column Filters")
     st.caption("Filters apply cumulatively.")
     st.button("🔁 Reset all filters", on_click=clear_all_filters)
-    DEBUG_ENRICHR = st.checkbox("🔧 Verbose API logs", value=False)
+    #DEBUG_ENRICHR = st.checkbox("🔧 Verbose API logs", value=False)
     
     for col in df.columns:
         if is_pmid_col(col):
