@@ -3,7 +3,7 @@
 # (robust Enrichr, recs, formatted EA, GMT term sizes, adjP-first,
 #  drop old p columns, Gene set size → Overlap # → Overlap %, real reset)
 # + Display truncation (~50 chars per cell) in AgGrid
-# + Robust CSV reading (encoding + delimiter sniff)
+# + Ultra-robust CSV reading (encoding + delimiter sniff + bad-line skip)
 # ==========================================================
 from io import BytesIO, StringIO
 import os, re, sys, traceback, numpy as np, pandas as pd, streamlit as st
@@ -190,25 +190,22 @@ def discover_repo_csv() -> Path | None:
         candidates = list(data_dir.glob("*.csv"))
     return candidates[0].resolve() if candidates else None
 
-# ---------- Robust CSV read (encoding + delimiter sniff) ----------
+# ---------- Ultra-robust CSV read (encoding + delimiter sniff + bad-line skip) ----------
 
 def read_csv_robust(path: Path) -> pd.DataFrame:
-    """Try multiple encodings and delimiter sniffing to avoid UnicodeDecodeError.
-    Falls back to replacing undecodable bytes so the app never crashes.
-    """
+    """Try multiple encodings and parsers; sniff delimiter; skip bad lines; never crash."""
     encodings = ["utf-8", "utf-8-sig", "cp1252", "latin-1"]
 
-    # First pass: default sep (comma)
+    # Pass 1: C engine, standard comma
     for enc in encodings:
         try:
-            df = pd.read_csv(csv_path, low_memory=False, encoding="cp1252")
+            return pd.read_csv(path, low_memory=False, encoding=enc)
         except UnicodeDecodeError:
             continue
         except Exception:
-            # keep trying
             continue
 
-    # Second pass: sniff delimiter using Python engine
+    # Pass 2: Python engine with delimiter sniffing
     for enc in encodings:
         try:
             return pd.read_csv(path, low_memory=False, encoding=enc, sep=None, engine="python")
@@ -217,13 +214,24 @@ def read_csv_robust(path: Path) -> pd.DataFrame:
         except Exception:
             continue
 
-    # Last resort: replace undecodable bytes
+    # Pass 3: Python engine, sniff + skip malformed rows
+    for enc in encodings:
+        try:
+            return pd.read_csv(path, low_memory=False, encoding=enc, sep=None, engine="python", on_bad_lines='skip')
+        except UnicodeDecodeError:
+            continue
+        except Exception:
+            continue
+
+    # Final fallback: read as text with replacement + strip NUL bytes
     try:
-        return pd.read_csv(path, low_memory=False, encoding="utf-8", encoding_errors="replace", sep=None, engine="python")
-    except TypeError:
-        # Older pandas without encoding_errors support
         text = Path(path).read_text(encoding="utf-8", errors="replace")
-        return pd.read_csv(StringIO(text), low_memory=False, sep=None, engine="python")
+    except Exception:
+        # If even read_text fails with utf-8, try cp1252 replacement
+        data = Path(path).read_bytes()
+        text = data.decode("cp1252", errors="replace")
+    text = text.replace("\x00", "")
+    return pd.read_csv(StringIO(text), low_memory=False, sep=None, engine="python", on_bad_lines='skip')
 
 # ---------- HTTP debug (optional) ----------
 
@@ -570,7 +578,7 @@ except Exception as e:
     st.error(f"Failed to locate dataset: {e}")
     st.stop()
 
-# >>> robust CSV read here <<<
+# >>> ultra-robust CSV read here <<<
 df = read_csv_robust(csv_path)
 
 st.caption(f"Loaded dataset: `{csv_path.name}` • {len(df):,} rows, {df.shape[1]} columns")
