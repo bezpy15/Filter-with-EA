@@ -2,8 +2,10 @@
 # BHB Study Finder — Dynamic Column Filters + Enrichr
 # (robust Enrichr, recs, formatted EA, GMT term sizes, adjP-first,
 #  drop old p columns, Gene set size → Overlap # → Overlap %, real reset)
+# + Display truncation (~50 chars per cell) in AgGrid
+# + Robust CSV reading (encoding + delimiter sniff)
 # ==========================================================
-from io import BytesIO
+from io import BytesIO, StringIO
 import os, re, sys, traceback, numpy as np, pandas as pd, streamlit as st
 from pathlib import Path
 import warnings, platform, json
@@ -158,6 +160,7 @@ def parse_id_equals_any(text: str) -> set:
 
 # ---------- Data discovery ----------
 APP_DIR = Path(__file__).resolve().parent
+
 def discover_repo_csv() -> Path | None:
     ds = None
     try:
@@ -187,7 +190,43 @@ def discover_repo_csv() -> Path | None:
         candidates = list(data_dir.glob("*.csv"))
     return candidates[0].resolve() if candidates else None
 
+# ---------- Robust CSV read (encoding + delimiter sniff) ----------
+
+def read_csv_robust(path: Path) -> pd.DataFrame:
+    """Try multiple encodings and delimiter sniffing to avoid UnicodeDecodeError.
+    Falls back to replacing undecodable bytes so the app never crashes.
+    """
+    encodings = ["utf-8", "utf-8-sig", "cp1252", "latin-1"]
+
+    # First pass: default sep (comma)
+    for enc in encodings:
+        try:
+            return pd.read_csv(path, low_memory=False, encoding=enc)
+        except UnicodeDecodeError:
+            continue
+        except Exception:
+            # keep trying
+            continue
+
+    # Second pass: sniff delimiter using Python engine
+    for enc in encodings:
+        try:
+            return pd.read_csv(path, low_memory=False, encoding=enc, sep=None, engine="python")
+        except UnicodeDecodeError:
+            continue
+        except Exception:
+            continue
+
+    # Last resort: replace undecodable bytes
+    try:
+        return pd.read_csv(path, low_memory=False, encoding="utf-8", encoding_errors="replace", sep=None, engine="python")
+    except TypeError:
+        # Older pandas without encoding_errors support
+        text = Path(path).read_text(encoding="utf-8", errors="replace")
+        return pd.read_csv(StringIO(text), low_memory=False, sep=None, engine="python")
+
 # ---------- HTTP debug (optional) ----------
+
 def http_debug(resp):
     try:
         st.write(f"**Request:** {resp.request.method} {resp.url}")
@@ -208,6 +247,7 @@ def _http_debug(resp):
         pass
 
 # ---------- Robust Enrichr session ----------
+
 def secrets_bool(key: str, default: bool = False) -> bool:
     try:
         return bool(st.secrets.get(key, default))  # type: ignore[attr-defined]
@@ -393,6 +433,7 @@ def enrichr_enrich(user_list_id: int, library: str, debug: bool = False) -> pd.D
     return _coerce_rows_to_df(rows)
 
 # ----- P-value formatting + term-size lookup (GMT) -----
+
 def _format_p(value) -> str:
     """4 d.p. normally; <1e-4 in compact scientific with real value."""
     try:
@@ -529,10 +570,13 @@ except Exception as e:
     st.error(f"Failed to locate dataset: {e}")
     st.stop()
 
-df = pd.read_csv(csv_path, low_memory=False)
+# >>> robust CSV read here <<<
+df = read_csv_robust(csv_path)
+
 st.caption(f"Loaded dataset: `{csv_path.name}` • {len(df):,} rows, {df.shape[1]} columns")
 
 # ---------- Reset logic ----------
+
 def clear_all_filters():
     # Flag a one-shot reset and clear individual filter widget states
     st.session_state["__do_reset__"] = True
@@ -707,6 +751,7 @@ st.subheader(f"📑 {len(result)} row{'s' if len(result)!=1 else ''} match your 
 
 PAGE_SIZE = 20
 GRID_HEIGHT = 600
+TRUNC = 50  # ~50 characters preview per cell
 
 if HAVE_AGGRID:
     gob = GridOptionsBuilder.from_dataframe(result)
@@ -716,6 +761,22 @@ if HAVE_AGGRID:
         gob.configure_pagination(paginationPageSize=PAGE_SIZE)
     gob.configure_default_column(filter=True, sortable=True, resizable=True)
     gob.configure_grid_options(domLayout="normal")
+
+    # --- truncate every column to ~50 chars in the grid ---
+    for c in result.columns:
+        gob.configure_column(
+            c,
+            tooltipField=c,  # show full value on hover
+            valueFormatter=f"""
+                function(params) {{
+                  if (params.value == null) return '';
+                  var s = params.value.toString();
+                  return s.length > {TRUNC} ? s.slice(0, {TRUNC}) + ' …' : s;
+                }}
+            """,
+            cellStyle={"white-space": "nowrap", "overflow": "hidden", "textOverflow": "ellipsis"},
+        )
+
     grid_opts = gob.build()
     AgGrid(
         result,
@@ -723,11 +784,16 @@ if HAVE_AGGRID:
         height=GRID_HEIGHT,
         theme="alpine",
         fit_columns_on_grid_load=False,
-        columns_auto_size_mode=(ColumnsAutoSizeMode.FIT_CONTENTS if ColumnsAutoSizeMode else None),
+        columns_auto_size_mode=None,  # disable auto-size-to-content (keeps truncation effective)
     )
 else:
     st.info("Interactive grid unavailable (streamlit-aggrid not installed). Showing a simple table instead.")
-    st.dataframe(result, use_container_width=True, height=GRID_HEIGHT)
+    # Fallback: show a shortened copy so large text doesn't overwhelm
+    def _short(v, n=TRUNC):
+        s = "" if pd.isna(v) else str(v)
+        return s if len(s) <= n else s[:n] + " …"
+    short = result.applymap(_short)
+    st.dataframe(short, use_container_width=True, height=GRID_HEIGHT)
 
 col_dl1, col_dl2 = st.columns(2)
 with col_dl1:
