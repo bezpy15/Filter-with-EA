@@ -2,10 +2,8 @@
 # BHB Study Finder — Dynamic Column Filters + Enrichr
 # (robust Enrichr, recs, formatted EA, GMT term sizes, adjP-first,
 #  drop old p columns, Gene set size → Overlap # → Overlap %, real reset)
-# + Display truncation (~50 chars per cell) in AgGrid
-# + Ultra-robust CSV reading (encoding + delimiter sniff + bad-line skip)
 # ==========================================================
-from io import BytesIO, StringIO
+from io import BytesIO
 import os, re, sys, traceback, numpy as np, pandas as pd, streamlit as st
 from pathlib import Path
 import warnings, platform, json
@@ -160,7 +158,6 @@ def parse_id_equals_any(text: str) -> set:
 
 # ---------- Data discovery ----------
 APP_DIR = Path(__file__).resolve().parent
-
 def discover_repo_csv() -> Path | None:
     ds = None
     try:
@@ -179,7 +176,7 @@ def discover_repo_csv() -> Path | None:
         if p.exists():
             return p
 
-    for name in ("bhb_s.csv", "studies.csv", "dataset.csv"):
+    for name in ("bhb_studies.csv", "studies.csv", "dataset.csv"):
         p = (APP_DIR / name).resolve()
         if p.exists():
             return p
@@ -190,51 +187,7 @@ def discover_repo_csv() -> Path | None:
         candidates = list(data_dir.glob("*.csv"))
     return candidates[0].resolve() if candidates else None
 
-# ---------- Ultra-robust CSV read (encoding + delimiter sniff + bad-line skip) ----------
-
-def read_csv_robust(path: Path) -> pd.DataFrame:
-    """Try multiple encodings and parsers; sniff delimiter; skip bad lines; never crash."""
-    encodings = ["utf-8", "utf-8-sig", "cp1252", "latin-1"]
-
-    # Pass 1: C engine, standard comma
-    for enc in encodings:
-        try:
-            return pd.read_csv(path, low_memory=False, encoding=enc)
-        except UnicodeDecodeError:
-            continue
-        except Exception:
-            continue
-
-    # Pass 2: Python engine with delimiter sniffing
-    for enc in encodings:
-        try:
-            return pd.read_csv(path, low_memory=False, encoding=enc, sep=None, engine="python")
-        except UnicodeDecodeError:
-            continue
-        except Exception:
-            continue
-
-    # Pass 3: Python engine, sniff + skip malformed rows
-    for enc in encodings:
-        try:
-            return pd.read_csv(path, low_memory=False, encoding=enc, sep=None, engine="python", on_bad_lines='skip')
-        except UnicodeDecodeError:
-            continue
-        except Exception:
-            continue
-
-    # Final fallback: read as text with replacement + strip NUL bytes
-    try:
-        text = Path(path).read_text(encoding="utf-8", errors="replace")
-    except Exception:
-        # If even read_text fails with utf-8, try cp1252 replacement
-        data = Path(path).read_bytes()
-        text = data.decode("cp1252", errors="replace")
-    text = text.replace("\x00", "")
-    return pd.read_csv(StringIO(text), low_memory=False, sep=None, engine="python", on_bad_lines='skip')
-
 # ---------- HTTP debug (optional) ----------
-
 def http_debug(resp):
     try:
         st.write(f"**Request:** {resp.request.method} {resp.url}")
@@ -255,7 +208,6 @@ def _http_debug(resp):
         pass
 
 # ---------- Robust Enrichr session ----------
-
 def secrets_bool(key: str, default: bool = False) -> bool:
     try:
         return bool(st.secrets.get(key, default))  # type: ignore[attr-defined]
@@ -441,7 +393,6 @@ def enrichr_enrich(user_list_id: int, library: str, debug: bool = False) -> pd.D
     return _coerce_rows_to_df(rows)
 
 # ----- P-value formatting + term-size lookup (GMT) -----
-
 def _format_p(value) -> str:
     """4 d.p. normally; <1e-4 in compact scientific with real value."""
     try:
@@ -572,19 +523,16 @@ csv_path = None
 try:
     csv_path = discover_repo_csv()
     if not csv_path:
-        st.error("No dataset found. Put a CSV in the repo root (e.g., `bhb_s.csv`) or set `DATASET_PATH` in Secrets.")
+        st.error("No dataset found. Put a CSV in the repo root (e.g., `bhb_studies.csv`) or set `DATASET_PATH` in Secrets.")
         st.stop()
 except Exception as e:
     st.error(f"Failed to locate dataset: {e}")
     st.stop()
 
-# >>> ultra-robust CSV read here <<<
-df = read_csv_robust(csv_path)
-
+df = pd.read_csv(csv_path, low_memory=False)
 st.caption(f"Loaded dataset: `{csv_path.name}` • {len(df):,} rows, {df.shape[1]} columns")
 
 # ---------- Reset logic ----------
-
 def clear_all_filters():
     # Flag a one-shot reset and clear individual filter widget states
     st.session_state["__do_reset__"] = True
@@ -759,7 +707,6 @@ st.subheader(f"📑 {len(result)} row{'s' if len(result)!=1 else ''} match your 
 
 PAGE_SIZE = 20
 GRID_HEIGHT = 600
-TRUNC = 50  # ~50 characters preview per cell
 
 if HAVE_AGGRID:
     gob = GridOptionsBuilder.from_dataframe(result)
@@ -769,22 +716,6 @@ if HAVE_AGGRID:
         gob.configure_pagination(paginationPageSize=PAGE_SIZE)
     gob.configure_default_column(filter=True, sortable=True, resizable=True)
     gob.configure_grid_options(domLayout="normal")
-
-    # --- truncate every column to ~50 chars in the grid ---
-    for c in result.columns:
-        gob.configure_column(
-            c,
-            tooltipField=c,  # show full value on hover
-            valueFormatter=f"""
-                function(params) {{
-                  if (params.value == null) return '';
-                  var s = params.value.toString();
-                  return s.length > {TRUNC} ? s.slice(0, {TRUNC}) + ' …' : s;
-                }}
-            """,
-            cellStyle={"white-space": "nowrap", "overflow": "hidden", "textOverflow": "ellipsis"},
-        )
-
     grid_opts = gob.build()
     AgGrid(
         result,
@@ -792,16 +723,11 @@ if HAVE_AGGRID:
         height=GRID_HEIGHT,
         theme="alpine",
         fit_columns_on_grid_load=False,
-        columns_auto_size_mode=None,  # disable auto-size-to-content (keeps truncation effective)
+        columns_auto_size_mode=(ColumnsAutoSizeMode.FIT_CONTENTS if ColumnsAutoSizeMode else None),
     )
 else:
     st.info("Interactive grid unavailable (streamlit-aggrid not installed). Showing a simple table instead.")
-    # Fallback: show a shortened copy so large text doesn't overwhelm
-    def _short(v, n=TRUNC):
-        s = "" if pd.isna(v) else str(v)
-        return s if len(s) <= n else s[:n] + " …"
-    short = result.applymap(_short)
-    st.dataframe(short, use_container_width=True, height=GRID_HEIGHT)
+    st.dataframe(result, use_container_width=True, height=GRID_HEIGHT)
 
 col_dl1, col_dl2 = st.columns(2)
 with col_dl1:
