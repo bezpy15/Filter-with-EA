@@ -201,7 +201,7 @@ def read_csv_robust(path: Path) -> pd.DataFrame:
     # First pass: default sep (comma)
     for enc in encodings:
         try:
-            return pd.read_csv(path, low_memory=False, encoding=enc)
+            df = pd.read_csv(csv_path, low_memory=False, encoding="cp1252")
         except UnicodeDecodeError:
             continue
         except Exception:
