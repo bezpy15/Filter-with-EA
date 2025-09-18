@@ -176,7 +176,7 @@ def discover_repo_csv() -> Path | None:
         if p.exists():
             return p
 
-    for name in ("bhb_studies.csv", "studies.csv", "dataset.csv"):
+    for name in ("bhb_s.csv", "studies.csv", "dataset.csv"):
         p = (APP_DIR / name).resolve()
         if p.exists():
             return p
@@ -523,7 +523,7 @@ csv_path = None
 try:
     csv_path = discover_repo_csv()
     if not csv_path:
-        st.error("No dataset found. Put a CSV in the repo root (e.g., `bhb_studies.csv`) or set `DATASET_PATH` in Secrets.")
+        st.error("No dataset found. Put a CSV in the repo root (e.g., `bhb_s.csv`) or set `DATASET_PATH` in Secrets.")
         st.stop()
 except Exception as e:
     st.error(f"Failed to locate dataset: {e}")
